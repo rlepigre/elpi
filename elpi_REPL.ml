@@ -62,6 +62,8 @@ let usage =
   "\t-I PATH  search for accumulated files in PATH\n" ^
   "\t-delay-problems-outside-pattern-fragment (deprecated, for Teyjus\n" ^
   "\t                                          compatibility)\n" ^
+  "\t-legacy-parser enable the legacy parser (deprecated)\n"^
+  "\t-legacy-parser-available exists with 0 if it is the case\n"^
   "\t--version prints the version of Elpi (also -v or -version)\n" ^ 
   "\t--help prints this help (also -h or -help)\n" ^ 
  API.Setup.usage ^
@@ -89,20 +91,22 @@ let _ =
   let delay_outside_fragment = ref false in 
   let print_passes = ref false in
   let print_units = ref false in
-  let print_accumulated_files = ref false in
   let extra_paths = ref [] in
+  let legacy_parser = ref false in
   let vars =
     ref API.Compile.(default_flags.defined_variables) in
   let rec eat_options = function
     | [] -> []
     | "-delay-problems-outside-pattern-fragment" :: rest -> delay_outside_fragment := true; eat_options rest
+    | "-legacy-parser" :: rest -> legacy_parser := true; eat_options rest
+    | "-legacy-parser-available" :: _ ->
+          if API.Setup.legacy_parser_available then exit 0 else exit 1
     | "-test" :: rest -> batch := true; test := true; eat_options rest
     | "-exec" :: goal :: rest ->  batch := true; exec := goal; eat_options rest
     | "-print" :: rest -> print_lprolog := true; eat_options rest
     | "-print-ast" :: rest -> print_ast := true; eat_options rest
     | "-print-passes" :: rest -> print_passes := true; eat_options rest
     | "-print-units" :: rest -> print_units := true; eat_options rest
-    | "-print-accumulated-files" :: rest -> print_accumulated_files := true; eat_options rest
     | "-no-tc" :: rest -> typecheck := false; eat_options rest
     | "-document-builtins" :: rest -> doc_builtins := true; eat_options rest
     | "-D" :: var :: rest -> vars := API.Compile.StrSet.add var !vars; eat_options rest
@@ -131,6 +135,7 @@ let _ =
   } in
   let elpi =
     API.Setup.init
+      ~legacy_parser:!legacy_parser
       ~flags:(API.Compile.to_setup_flags flags)
       ~builtins:[Builtin.std_builtins]
       ~file_resolver:(API.Parse.std_resolver ~paths ())
@@ -153,10 +158,9 @@ let _ =
   end;
   let t0_parsing = Unix.gettimeofday () in
   let p =
-    try API.Parse.program ~elpi
-          ~print_accumulated_files:!print_accumulated_files files
+    try API.Parse.program ~elpi ~files
     with API.Parse.ParseError(loc,err) ->
-      Printf.eprintf "%s: %s\n" (API.Ast.Loc.show loc) err;
+      Printf.eprintf "%s %s\n" (API.Ast.Loc.show loc) err;
       exit 1;
   in
   if !print_ast then begin
@@ -164,17 +168,18 @@ let _ =
     exit 0;
   end;
   let g =
-    if !test then API.Parse.goal (API.Ast.Loc.initial "(-test)") "main."
+    if !test then
+      API.Parse.goal ~elpi ~loc:(API.Ast.Loc.initial "(-test)") ~text:"main."
     else if !exec <> "" then
-      begin API.Parse.goal
-        (API.Ast.Loc.initial "(-exec)")
-        (Printf.sprintf "%s [%s]." !exec
+      begin API.Parse.goal ~elpi
+        ~loc:(API.Ast.Loc.initial "(-exec)")
+        ~text:(Printf.sprintf "%s [%s]." !exec
           String.(concat ", " (List.map (Printf.sprintf "\"%s\"") argv)))
          end
     else begin
      Printf.printf "goal> %!";
-     let strm = Stream.of_channel stdin in
-     try API.Parse.goal_from_stream (API.Ast.Loc.initial "(stdin)") strm
+     let buff = Lexing.from_channel stdin in
+     try API.Parse.goal_from ~elpi ~loc:(API.Ast.Loc.initial "(stdin)") buff
      with API.Parse.ParseError(loc,err) ->
         Printf.eprintf "%s: %s\n" (API.Ast.Loc.show loc) err;
         exit 1;
