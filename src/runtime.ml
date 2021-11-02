@@ -376,11 +376,9 @@ module ConstraintStoreAndTrail : sig
 
   type trail
  
-  val empty : trail
+  val empty : unit -> trail
 
-  val initial_trail : trail Fork.local_ref
   val trail : trail Fork.local_ref
-  val cut_trail : unit -> unit [@@inline]
 
   (* If true, no need to trail an imperative action.  Not part of trial_this
    * because you can save allocations and a function call by testing locally *)
@@ -419,20 +417,18 @@ end = struct (* {{{ *)
 
 
 type trail_item =
-| Assignement of uvar_body
-| StuckGoalAddition of stuck_goal
-| StuckGoalRemoval of stuck_goal
+  | Assignement of uvar_body * trail
+  | Restore of uvar_body * term * trail
+  | StuckGoalAddition of stuck_goal * trail
+  | StuckGoalRemoval of stuck_goal * trail
+  | Top
+and trail = trail_item ref
 [@@deriving show]
 
-type trail = trail_item list
-[@@deriving show]
-let empty = []
+let empty () = ref Top
 
-let trail = Fork.new_local []
-let initial_trail = Fork.new_local []
+let trail = Fork.new_local (empty ())
 let last_call = Fork.new_local false;;
-
-let cut_trail () = trail := !initial_trail [@@inline];;
 
 module Ugly = struct let delayed : stuck_goal list ref = Fork.new_local [] end
 open Ugly
@@ -447,18 +443,31 @@ let contents ?overlapping () =
     | _ -> None) !delayed
 
 let trail_assignment x =
-  [%spy "dev:trail:assign" ~rid Fmt.pp_print_bool !last_call pp_trail_item (Assignement x)];
-  if not !last_call then trail := Assignement x :: !trail
+  assert(! (!trail) = Top);
+  if not !last_call then begin
+    let new_top = ref Top in
+    [%spy "dev:trail:assign" ~rid Fmt.pp_print_bool !last_call pp_trail_item (Assignement(x,new_top))];
+    !trail := Assignement(x ,new_top);
+    trail := new_top;
+  end;
   [@@inline]
 ;;
 let trail_stuck_goal_addition x =
-  [%spy "dev:trail:add-constraint" ~rid Fmt.pp_print_bool !last_call pp_trail_item (StuckGoalAddition x)];
-  if not !last_call then trail := StuckGoalAddition x :: !trail
+  if not !last_call then begin
+    let new_top = ref Top in
+    [%spy "dev:trail:add-constraint" ~rid Fmt.pp_print_bool !last_call pp_trail_item (StuckGoalAddition(x,new_top))];
+    !trail := StuckGoalAddition(x,new_top);
+    trail := new_top;
+  end;
   [@@inline]
 ;;
 let trail_stuck_goal_removal x =
-  [%spy "dev:trail:remove-constraint" ~rid Fmt.pp_print_bool !last_call pp_trail_item (StuckGoalRemoval x)];
-  if not !last_call then trail := StuckGoalRemoval x :: !trail
+  if not !last_call then begin
+    let new_top = ref Top in
+    [%spy "dev:trail:remove-constraint" ~rid Fmt.pp_print_bool !last_call pp_trail_item (StuckGoalRemoval(x,new_top))];
+    !trail := StuckGoalRemoval(x,new_top);
+    trail := new_top;
+  end;
   [@@inline]
 ;;
 
@@ -523,15 +532,34 @@ let undo ~old_trail ?old_state () =
    rules. *)
   to_resume := []; new_delayed := [];
   [%spy "dev:trail:undo" ~rid pp_trail !trail pp_string "->" pp_trail old_trail];
-  while !trail != old_trail do
-    match !trail with
-    | Assignement r :: rest ->
-       r.contents <- C.dummy;
-       trail := rest
-    | StuckGoalAddition sg :: rest -> remove sg; trail := rest
-    | StuckGoalRemoval sg :: rest -> add sg; trail := rest
-    | [] -> anomaly "undo to unknown trail"
-  done;
+  let rec aux h k =
+    match !h with
+    | Top -> k ()
+    | Assignement(r,h') ->
+        aux h' (fun () ->
+          h' := Restore(r,r.contents, h);
+          r.contents <- C.dummy;
+          k ())
+    | Restore(r,v,h') ->
+        aux h' (fun () ->
+          h' := Assignement(r,h);
+          r.contents <- v;
+          k ())
+    | StuckGoalAddition(sg,h') ->
+        aux h' (fun () ->
+          h := StuckGoalRemoval(sg,h);
+          remove sg;
+          k ())
+    | StuckGoalRemoval(sg,h') ->
+      aux h' (fun () ->
+        h := StuckGoalAddition(sg,h);
+        add sg;
+        k ())
+    in
+  aux old_trail (fun () ->
+    trail := old_trail;
+    old_trail := Top);
+  assert(!(!trail) = Top);
   match old_state with
   | Some old_state -> state := old_state
   | None -> ()
@@ -3451,7 +3479,7 @@ let make_runtime : ?max_steps: int -> ?delay_outside_fragment: bool -> 'x execut
         end in
       prune alts
       ) alts];
-    if cutto_alts == noalts then (T.cut_trail[@inlined]) ();
+    if cutto_alts == noalts then T.trail := T.empty ();
     match gs with
     | [] -> pop_andl cutto_alts next cutto_alts
     | { depth; program; goal; gid = gid [@trace] } :: gs -> run depth program goal (gid[@trace]) gs next cutto_alts cutto_alts
@@ -3579,8 +3607,7 @@ end;*)
   let { Fork.exec = exec ; get = get ; set = set } = Fork.fork () in
   set orig_prolog_program compiled_program;
   set Constraints.chrules chr;
-  set T.initial_trail T.empty;
-  set T.trail T.empty;
+  set T.trail (T.empty ());
   set T.last_call false;
   set CS.new_delayed [];
   set CS.to_resume [];
@@ -3594,9 +3621,9 @@ end;*)
   set rid !max_runtime_id;
   let search = exec (fun () ->
      [%spy "dev:trail:init" ~rid (fun fmt () -> T.print_trail fmt) ()];
-     T.initial_trail := !T.trail;
+     set T.trail (T.empty ());
      run initial_depth !orig_prolog_program initial_goal ((UUID.make ())[@trace]) [] FNil noalts noalts) in
-  let destroy () = exec (fun () -> T.undo ~old_trail:T.empty ()) () in
+  let destroy () = () in
   let next_solution = exec next_alt in
   incr max_runtime_id;
   { search; next_solution; destroy; exec; get }
