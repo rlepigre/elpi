@@ -2741,29 +2741,37 @@ let repack_goal (gid[@trace]) ~depth program goal =
   { depth ; program ; goal ; gid = gid [@trace] }
   [@@inline]
 
-
-(* The activation frames points to the choice point that
-   cut should backtrack to, i.e. the first one not to be
-   removed. We call it catto_alts in the code. *)
-type frame =
- | FNil
- | FCons of (*lvl:*)alternative * goal list * frame
-and alternative = {
-  cutto_alts : alternative;
-  program : prolog_prog;
-  adepth : int;
-  agoal_hd : constant;
-  ogoal_arg : term;
-  ogoal_args : term list;
-  agid : UUID.t; [@trace]
-  goals : goal list;
-  stack : frame;
-  trail : T.trail;
-  state : State.t;
-  clauses : clause list;
-  next : alternative;
+type goals_crumbles = {
+  predicate : constant;
+  fst_arg : term;
+  other_args : term list;
+  brothers : goal list;
 }
-let noalts : alternative = Obj.magic 0
+
+(* The tree *)
+type continuation = (* the AND part, what to do next *)
+ | Done
+ | ExitSLGRoot of { heap : unit; next : continuation; alts : alternative }
+ | TableSolution of unit
+ | SolveGoals of { cutto_alts : alternative; brothers : goal list; next : continuation }
+and alternative = (* the OR part, what to do if we fail *)
+ | Noalts
+ | UnblockSLGGenerator of slg_generator (* a branch of the tree that could have been cut *)
+ | ExploreAnotherSLDPath of {
+    program : prolog_prog;
+    adepth : int;
+    path : goals_crumbles;
+    agid : UUID.t; [@trace]
+    stack : continuation;
+    trail : T.trail;
+    state : State.t;
+    clauses : clause list;
+    alts : alternative;
+    cutto_alts : alternative;
+   }
+and slg_generator =
+  | Root of { root_goal : term; root_goal_args : int; clauses : clause list; }
+  | UnexploredBranches of { heap : unit; alts : alternative }
 
 (******************************************************************************
   Constraint propagation
@@ -3333,7 +3341,7 @@ let pp_candidate ~depth ~k fmt ({ loc } as cl) =
 let make_runtime : ?max_steps: int -> ?delay_outside_fragment: bool -> 'x executable -> 'x runtime =
   (* Input to be read as the orl (((p,g)::gs)::next)::alts
      depth >= 0 is the number of variables in the context. *)
-  let rec run depth p g (gid[@trace]) gs (next : frame) alts cutto_alts =
+  let rec run depth p g (gid[@trace]) gs (next : continuation) alts cutto_alts =
     [%cur_pred (pred_of g)];
     [%trace "run" ~rid begin
 
@@ -3405,11 +3413,11 @@ let make_runtime : ?max_steps: int -> ?delay_outside_fragment: bool -> 'x execut
     | Const k -> [%spy "user:rule" ~rid ~gid pp_string "backchain"];
        let clauses = get_clauses depth k g p in
        [%spyl "user:candidates" ~rid ~gid (pp_candidate ~depth ~k) clauses];
-       [%tcall backchain depth p (k, C.dummy, [], gs) (gid[@trace]) next alts cutto_alts clauses]
+       [%tcall backchain depth p  { predicate = k; fst_arg = C.dummy; other_args = []; brothers = gs} (gid[@trace]) next alts cutto_alts clauses]
     | App (k,x,xs) -> [%spy "user:rule" ~rid ~gid pp_string "backchain"];
        let clauses = get_clauses depth k g p in
        [%spyl "user:candidates" ~rid ~gid (pp_candidate ~depth ~k) clauses];
-       [%tcall backchain depth p (k, x, xs, gs) (gid[@trace]) next alts cutto_alts clauses]
+       [%tcall backchain depth p  { predicate = k; fst_arg = x; other_args = xs; brothers = gs} (gid[@trace]) next alts cutto_alts clauses]
     | Builtin(c, args) -> [%spy "user:rule" ~rid ~gid pp_string "builtin"];
        begin match Constraints.exect_builtin_predicate c ~depth p (gid[@trace]) args with
        | gs' ->
@@ -3428,15 +3436,15 @@ let make_runtime : ?max_steps: int -> ?delay_outside_fragment: bool -> 'x execut
         error "The goal is a flexible term"
   end]
 
-  (* We pack some arguments into a tuple otherwise we consume too much stack *)
-  and backchain depth p (k, arg, args_of_g, gs) (gid[@trace]) next alts cutto_alts cp = [%trace "select" ~rid begin
+  (* We pack some arguments into the goals_crumbles record otherwise we consume too much stack *)
+  and backchain depth p ({ predicate = k; fst_arg = arg; other_args = args_of_g; brothers = gs} as g_gs) (gid[@trace]) next alts cutto_alts cp = [%trace "select" ~rid begin
     match cp with
       | [] -> [%spy "user:select" ~rid ~gid pp_string "fail"];
         [%tcall next_alt alts]
       | { depth = c_depth; mode = c_mode; args = c_args; hyps = c_hyps; vars = c_vars; loc } :: cs ->
         [%spy "user:select" ~rid ~gid (pp_option Util.CData.pp) (Util.option_map Ast.cloc.Util.CData.cin loc) (ppclause ~depth ~hd:k) { depth = c_depth; mode = c_mode; args = c_args; hyps = c_hyps; vars = c_vars; loc }];
         let old_trail = !T.trail in
-        T.last_call := alts == noalts && cs == [];
+        T.last_call := alts == Noalts && cs == [];
         let env = Array.make c_vars C.dummy in
         match
           match c_args with
@@ -3446,21 +3454,21 @@ let make_runtime : ?max_steps: int -> ?delay_outside_fragment: bool -> 'x execut
              | [] -> unif ~argsdepth:depth ~matching:false (gid[@trace]) depth env c_depth arg x && for_all23 ~argsdepth:depth (unif (gid[@trace])) depth env c_depth args_of_g xs
              | matching :: ms -> unif ~argsdepth:depth ~matching (gid[@trace]) depth env c_depth arg x && for_all3b3 ~argsdepth:depth (unif (gid[@trace])) depth env c_depth args_of_g xs ms false
         with
-        | false -> T.undo old_trail (); [%tcall backchain depth p (k, arg, args_of_g, gs) (gid[@trace]) next alts cutto_alts cs]
+        | false -> T.undo old_trail (); [%tcall backchain depth p g_gs (gid[@trace]) next alts cutto_alts cs]
         | true ->
            let oldalts = alts in
            let alts = if cs = [] then alts else
-             { program = p; adepth = depth; agoal_hd = k; ogoal_arg = arg; ogoal_args = args_of_g; agid = gid[@trace]; goals = gs; stack = next;
+            ExploreAnotherSLDPath { program = p; adepth = depth; path = g_gs; agid = gid[@trace]; stack = next;
                trail = old_trail;
                state = !CS.state;
-               clauses = cs; cutto_alts = cutto_alts ; next = alts} in
+               clauses = cs; cutto_alts = cutto_alts ; alts} in
            begin match c_hyps with
            | [] ->
               begin match gs with
               | [] -> [%tcall pop_andl alts next cutto_alts]
               | { depth ; program; goal; gid = gid [@trace] } :: gs -> [%tcall run depth program goal (gid[@trace]) gs next alts cutto_alts] end
            | h::hs ->
-              let next = if gs = [] then next else FCons (cutto_alts,gs,next) in
+              let next = if gs = [] then next else SolveGoals { cutto_alts; brothers = gs; next } in
               let h = move ~argsdepth:depth ~from:c_depth ~to_:depth env h in
               let hs =
                 List.map (fun x->
@@ -3472,14 +3480,18 @@ let make_runtime : ?max_steps: int -> ?delay_outside_fragment: bool -> 'x execut
 
   and cut (gid[@trace]) gs next (alts[@trace]) cutto_alts =
     [%spy "user:cut" ~rid ~gid (fun fmt alts ->
-      let rec prune ({ agid = agid[@trace]; clauses; adepth = depth; agoal_hd = hd } as alts) =
-        if alts != cutto_alts then begin
-          Format.fprintf fmt "%a" (pplist (ppclause ~depth ~hd) " | ") clauses;
-          prune alts.next
-        end in
+      let rec prune alts =
+        if alts = cutto_alts then () else
+          match alts with
+          | ExploreAnotherSLDPath ({ agid = agid[@trace]; clauses; adepth = depth; path = { predicate = hd } } as alts) ->
+              Format.fprintf fmt "%a" (pplist (ppclause ~depth ~hd) " | ") clauses;
+              prune alts.alts
+          | Noalts -> ()
+          | UnblockSLGGenerator _ -> ()
+        in
       prune alts
       ) alts];
-    if cutto_alts == noalts then T.trail := T.empty ();
+    if cutto_alts == Noalts then T.trail := T.empty ();
     match gs with
     | [] -> pop_andl cutto_alts next cutto_alts
     | { depth; program; goal; gid = gid [@trace] } :: gs -> run depth program goal (gid[@trace]) gs next cutto_alts cutto_alts
@@ -3510,7 +3522,7 @@ let make_runtime : ?max_steps: int -> ?delay_outside_fragment: bool -> 'x execut
       let sol = copy g in
       [%spy "findall solution:" ~rid ~gid (ppterm depth [] ~argsdepth:0 empty_env) g];
       solutions := sol :: !solutions in
-    let alternatives = ref noalts in
+    let alternatives = ref Noalts in
     try
       alternatives := search ();
       add_sol ();
@@ -3533,18 +3545,20 @@ let make_runtime : ?max_steps: int -> ?delay_outside_fragment: bool -> 'x execut
 
   and pop_andl alts next cutto_alts =
    match next with
-    | FNil ->
+    | Done ->
         (match resume_all () with
            None ->
             Fmt.fprintf Fmt.std_formatter
              "Undo triggered by goal resumption\n%!";
             [%tcall next_alt alts]
          | Some ({ depth; program; goal; gid = gid [@trace] } :: gs) ->
-            run depth program goal (gid[@trace]) gs FNil alts cutto_alts
+            run depth program goal (gid[@trace]) gs Done alts cutto_alts
          | Some [] -> alts)
-    | FCons (_,[],_) -> anomaly "empty stack frame"
-    | FCons(cutto_alts, { depth; program; goal; gid = gid [@trace] } :: gs, next) ->
+    | SolveGoals { brothers = []; _ } -> anomaly "empty continuation"
+    | SolveGoals { cutto_alts; brothers = { depth; program; goal; gid = gid [@trace] } :: gs; next } ->
         run depth program goal (gid[@trace]) gs next alts cutto_alts
+    | ExitSLGRoot _ -> assert false
+    | TableSolution _ -> assert false
 
   and resume_all () : goal list option =
 (*     if fm then Some [] else *)
@@ -3584,13 +3598,14 @@ end;*)
    else None
 
   and next_alt alts =
-   if alts == noalts then raise No_clause
-   else
-     let { program = p; clauses; agoal_hd = k; ogoal_arg = arg; ogoal_args = args; agid = gid [@trace]; goals = gs; stack = next;
-          trail = old_trail; state = old_state;
-          adepth = depth; cutto_alts = cutto_alts; next = alts} = alts in
-    T.undo ~old_trail ~old_state ();
-    backchain depth p (k, arg, args, gs) (gid[@trace]) next alts cutto_alts clauses
+    match alts with
+    | ExploreAnotherSLDPath { program = p; clauses; path; agid = gid [@trace]; stack = next;
+        trail = old_trail; state = old_state;
+        adepth = depth; cutto_alts = cutto_alts; alts} ->
+      T.undo ~old_trail ~old_state ();
+      backchain depth p path (gid[@trace]) next alts cutto_alts clauses
+    | UnblockSLGGenerator _ -> assert false
+    | Noalts -> raise No_clause
   in
 
  (* Finally the runtime *)
@@ -3622,7 +3637,7 @@ end;*)
   let search = exec (fun () ->
      [%spy "dev:trail:init" ~rid (fun fmt () -> T.print_trail fmt) ()];
      set T.trail (T.empty ());
-     run initial_depth !orig_prolog_program initial_goal ((UUID.make ())[@trace]) [] FNil noalts noalts) in
+     run initial_depth !orig_prolog_program initial_goal ((UUID.make ())[@trace]) [] Done Noalts Noalts) in
   let destroy () = () in
   let next_solution = exec next_alt in
   incr max_runtime_id;
@@ -3651,8 +3666,8 @@ let mk_outcome search get_cs assignments =
    } in
    Success solution, alts
  with
- | No_clause (*| Non_linear*) -> Failure, noalts
- | No_more_steps -> NoMoreSteps, noalts
+ | No_clause (*| Non_linear*) -> Failure, Noalts
+ | No_more_steps -> NoMoreSteps, Noalts
 
 let execute_once ?max_steps ?delay_outside_fragment exec =
  auxsg := [];
@@ -3662,7 +3677,7 @@ let execute_once ?max_steps ?delay_outside_fragment exec =
 
 let execute_loop ?delay_outside_fragment exec ~more ~pp =
  let { search; next_solution; get } = make_runtime ?delay_outside_fragment exec in
- let k = ref noalts in
+ let k = ref Noalts in
  let do_with_infos f =
    let time0 = Unix.gettimeofday() in
    let o, alts = mk_outcome f (fun () -> get CS.Ugly.delayed, get CS.state |> State.end_execution, exec.query_arguments, { Data.uv_names = ref (get Pp.uv_names); table = get C.table }) exec.assignments in
@@ -3670,10 +3685,10 @@ let execute_loop ?delay_outside_fragment exec ~more ~pp =
    k := alts;
    pp (time1 -. time0) o in
  do_with_infos search;
- while !k != noalts do
-   if not(more()) then k := noalts else
+ while !k != Noalts do
+   if not(more()) then k := Noalts else
    try do_with_infos (fun () -> next_solution !k)
-   with No_clause -> pp 0.0 Failure; k := noalts
+   with No_clause -> pp 0.0 Failure; k := Noalts
  done
 ;;
 
